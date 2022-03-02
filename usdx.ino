@@ -41,6 +41,7 @@
 //#define MOX_ENABLE     1   // Monitor-On-Xmit which is audio monitoring on speaker during transmit
 #define FAST_AGC       1   // Adds fast AGC option (good for CW)
 #define VSS_METER      1   // Supports Vss measurement (as s-meter option), requires resistor of 1M between 12V and pin 26 (PC3)
+#define S_CUSTOM       1  // Enable display of custom values for debug purposes
 #define SWR_METER      1   // Supports SWR meter with bridge on A6/A7 (LQPF ATMEGA328P) by Alain, K1FM, see: https://groups.io/g/ucx/message/6262 and https://groups.io/g/ucx/message/6361
 //#define ONEBUTTON      1   // Use single (encoder) button to control full the rig; optionally use L/R buttons to completely replace rotory encoder function
 //#define DEBUG          1   // for development purposes only (adds debugging features such as CPU, sample-rate measurement, additional parameters)
@@ -137,7 +138,7 @@
 #ifdef SWR_METER
 float FWD;
 float SWR;
-float ref_V = 5 * 1.15;
+float ref_V = 6.0 * 1.15;
 static uint32_t stimer;
 #define PIN_FWD  A6
 #define PIN_REF  A7
@@ -180,9 +181,9 @@ ssb_cap=1; dsp_cap=2;
 #if !(defined(ARDUINO_ARCH_AVR))
    #error "Unsupported architecture, select Arduino IDE > Tools > Board > Arduino AVR Boards > Arduino Uno."
 #endif
-#if(F_CPU != 16000000)
-   #error "Unsupported clock frequency, Arduino IDE must specify 16MHz clock; alternate crystal frequencies may be specified with F_MCU."
-#endif
+//#if(F_CPU != 16000000)
+//   #error "Unsupported clock frequency, Arduino IDE must specify 16MHz clock; alternate crystal frequencies may be specified with F_MCU."
+//#endif
 #undef F_CPU
 #define F_CPU 20007000  // Actual crystal frequency of 20MHz XTAL1, note that this declaration is just informative and does not correct the timing in Arduino functions like delay(); hence a 1.25 factor needs to be added for correction.
 #ifndef F_MCU
@@ -2082,6 +2083,7 @@ inline int16_t ssb(int16_t in)
 #define MIC_ATTEN  0  // 0*6dB attenuation (note that the LSB bits are quite noisy)
 volatile int8_t mox = 0;
 volatile int8_t volume = 12;
+bool squelch_open = true;
 
 // This is the ADC ISR, issued with sample-rate via timer1 compb interrupt.
 // It performs in real-time the ADC sampling, calculation of SSB phase-differences, calculation of SI5351 frequency registers and send the registers to SI5351 over I2C.
@@ -2194,8 +2196,9 @@ void dsp_tx_fm()
   si5351.SendPLLRegisterBulk();       // submit frequency registers to SI5351 over 731kbit/s I2C (transfer takes 64/731 = 88us, then PLL-loopfilter probably needs 50us to stabalize)
   int16_t adc = ADC - 512; // current ADC sample 10-bits analog input, NOTE: first ADCL, then ADCH
   int16_t in = (adc >> MIC_ATTEN);
-  in = in << (drive);
+  in = in << (drive+2);
   int16_t df = in;
+
   si5351.freq_calc_fast(df);           // calculate SI5351 registers based on frequency shift and carrier frequency
 }
 
@@ -2520,7 +2523,7 @@ inline int16_t process_agc(int16_t in)
     out = (centiGain >> 2) * (in >> 3);  // net gain < 1
   out >>= 2;
 
-  if(HI(abs(out)) > HI(1536)){
+  if(HI(abs(out)) > HI(1536) && centiGain > 16){
     centiGain -= (centiGain >> 4);       // Fast attack time when big signal encountered (relies on CentiGain >= 16)
   } else {
     if(HI(abs(out)) > HI(1024))
@@ -2794,23 +2797,37 @@ inline int16_t slow_dsp(int16_t ac)
 
   if(mode == AM) {
     ac = magn(i, q);
+   /*
+    * The detector I am using is called a Async complex AM detector.  It is simpler than the squareroot of I^2 + Q^2.
+https://www.dsprelated.com/showarticle/938.php
+
+Since I and Q exists :  ac = abs(i) + abs(q);  and then follow up wth restoring the DC level as above.
+I also added a lowpass filter as shown in the link above.  My code is a Teensy version, so I do not have lowpass filter code for the ATMega328.
+*/
+
+  //  ac = abs(i) + abs(q);
     { static int16_t dc;   // DC decoupling
       dc += (ac - dc) / 2;
       ac = ac - dc; }
   } else if(mode == FM){
-  /*  static int16_t zi;
-    ac = ((ac + i) * zi);  // -qh = ac + i
-    zi =i; */
-    /*int16_t z0 = _arctan3(q, i);
-    static int16_t z1;
-    ac = z0 - z1; // Differentiator
-    z1 = z0;*/
-   /* static int16_t _q;
-    _q = (_q + q) / 2;
+
+//    static int16_t zi;
+//    ac = ((ac + i) * zi);  // -qh = ac + i
+//    zi =i;
+    //int16_t z0 = _arctan3(q, i);
+    //static int16_t z1;
+    //ac = z0 - z1; // Differentiator
+    //z1 = z0;
+    //static int16_t _q;
+    //_q = (_q + q) / 2;
     //ac = i * _q;  // quadrature detector */
-    ac = ((q > 0) == !(i > 0)) ? 128 : -128; // XOR I/Q zero-cross detector
+    //ac = ((q > 0) == !(i > 0)) ? 128 : -128; // XOR I/Q zero-cross detector
+    ac = abs(i) + abs(q);
+    { static int16_t dc;   // DC decoupling
+      dc += (ac - dc) / 2;
+      ac = ac - dc; }
   }  // needs: p.12 https://www.veron.nl/wp-content/uploads/2014/01/FmDemodulator.pdf
-  else { ; }  // USB, LSB, CW
+  else {  ; }  // USB, LSB, CW
 
 #ifdef FAST_AGC
   if(agc == 2) {
@@ -2862,7 +2879,12 @@ inline int16_t slow_dsp(int16_t ac)
 #ifdef QCX
   if(!dsp_cap) return 0;  // in QCX-SSB mode (no DSP), slow_dsp() should return 0 (in order to prevent upsampling filter to generate audio)
 #endif
-  return ac;
+
+  // Return audio only if squelch is open
+  if (squelch_open)
+    return ac;
+  else
+    return 0;
 
 }
 
@@ -2990,6 +3012,7 @@ void process(int16_t i_ac2, int16_t q_ac2)
   i = i_ac2; q = q_ac2;   // tbd: this can be more efficient
   int16_t i = v[0]; v[0] = v[1]; v[1] = v[2]; v[2] = v[3]; v[3] = v[4]; v[4] = v[5]; v[5] = v[6]; v[6] = i_ac2;  // Delay to match Hilbert transform on Q branch
   ac3 = slow_dsp(-i - qh);  //inverting I and Q helps dampening a feedback-loop between PWM out and ADC inputs
+
 #ifdef OUTLET
   tc--;
 #endif
@@ -3423,6 +3446,7 @@ void sdr_rx()
         int16_t ac = i + qh;
         ac = slow_dsp(ac);
 
+
         // Output stage
         static int16_t ozd1, ozd2;
         if(_init){ ac = 0; ozd1 = 0; ozd2 = 0; _init = 0; } // hack: on first sample init accumlators of further stages (to prevent instability)
@@ -3712,6 +3736,11 @@ int16_t smeter(int16_t ref = 0)
       for(uint8_t i = 0; i != 4; i++){ tmp[i] = max(2, min(5, s + 1)); s = s - 3; } tmp[4] = 0;
       lcd.setCursor(12, 0); lcd.print(tmp);
     }
+#ifdef S_CUSTOM
+    if(smode == 6){ // s_custom (currently AGC value)
+      lcd.setCursor(12, 0); lcd.print((int16_t)centiGain); lcd.print("  ");
+    }
+#endif
 #ifdef CW_DECODER
     if(smode == 4){ // wpm-indicator
       lcd.setCursor(14, 0); if(mode == CW) lcd.print(wpm); lcd.print("  ");
@@ -3719,9 +3748,9 @@ int16_t smeter(int16_t ref = 0)
 #endif  //CW_DECODER
 #ifdef VSS_METER
     if(smode == 5){ // Supply-voltage indicator; add resistor of value R_VSS (see below) between 12V supply input and pin 26 (PC3)   Contribution by Jeff WB4LCG: https://groups.io/g/ucx/message/4470
-#define R_VSS   1000 // for 1000kOhm from VSS to PC3 (and 10kOhm to GND). Correct this value until VSS is matching
-      uint8_t vss10 = (uint32_t)analogSafeRead(BUTTONS, true) * (R_VSS + 10) * 11 / (10 * 1024);   // use for a 1.1V ADC range VSS measurement
-      //uint8_t vss10 = (uint32_t)analogSafeRead(BUTTONS, false) * (R_VSS + 10) * 50 / (10 * 1024);  // use for a 5V ADC range VSS measurement (use for 100k value of R_VSS)
+#define R_VSS   92 // for 1000kOhm from VSS to PC3 (and 10kOhm to GND). Correct this value until VSS is matching
+      //uint8_t vss10 = (uint32_t)analogSafeRead(BUTTONS, true) * (R_VSS + 10) * 11 / (10 * 1024);   // use for a 1.1V ADC range VSS measurement
+      uint8_t vss10 = (uint32_t)analogSafeRead(BUTTONS, false) * (R_VSS + 10) * 50 / (10 * 1024);  // use for a 5V ADC range VSS measurement (use for 100k value of R_VSS)
       lcd.setCursor(10, 0); lcd.print(vss10/10); lcd.print('.'); lcd.print(vss10%10); lcd.print("V ");
     }
 #endif //VSS_METER
@@ -3738,6 +3767,17 @@ int16_t smeter(int16_t ref = 0)
     max_absavg256 /= 2;  // Implement peak hold/decay for all meter types    
   }
   return dbm;
+}
+
+uint8_t squelch_level = 0;
+
+void process_squelch() {
+  if (squelch_level > 0) {
+    // Relies on s-meter function to decide if the squelch should be opened or not
+    uint8_t s = (dbm < -63) ? ((dbm - -127) / 6) : (((uint8_t)(dbm - -73)) / 10) * 10; 
+    if (s >= squelch_level) squelch_open = true;
+    else squelch_open = false; 
+  } else squelch_open = true; 
 }
 
 void start_rx()
@@ -3951,15 +3991,15 @@ void calibrate_iq()
 
 uint8_t prev_bandval = 3;
 uint8_t bandval = 3;
-#define N_BANDS 11
+#define N_BANDS 12
 
 #ifdef CW_FREQS_QRP
-uint32_t band[N_BANDS] = { /*472000,*/ 1810000, 3560000, 5351500, 7030000, 10106000, 14060000, 18096000, 21060000, 24906000, 28060000, 50096000/*, 70160000, 144060000*/ };  // CW QRP freqs
+uint32_t band[N_BANDS] = { /*472000,*/ 1810000, 3560000, 5351500, 7030000, 10106000, 14060000, 18096000, 21060000, 24906000, 27555000, 28060000, 50096000/*, 70160000, 144060000*/ };  // CW QRP freqs
 #else
 #ifdef CW_FREQS_FISTS
-uint32_t band[N_BANDS] = { /*472000,*/ 1818000, 3558000, 5351500, 7028000, 10118000, 14058000, 18085000, 21058000, 24908000, 28058000, 50058000/*, 70158000, 144058000*/ };  // CW FISTS freqs
+uint32_t band[N_BANDS] = { /*472000,*/ 1818000, 3558000, 5351500, 7028000, 10118000, 14058000, 18085000, 21058000, 24908000, 27555000, 28058000, 50058000/*, 70158000, 144058000*/ };  // CW FISTS freqs
 #else
-uint32_t band[N_BANDS] = { /*472000,*/ 1840000, 3573000, 5357000, 7074000, 10136000, 14074000, 18100000, 21074000, 24915000, 28074000, 50313000/*, 70101000, 144125000*/ };  // FT8 freqs
+uint32_t band[N_BANDS] = { /*472000,*/ 1840000, 3573000, 5357000, 7074000, 10136000, 14074000, 18100000, 21074000, 24915000, 27555000, 28074000, 50313000/*, 70101000, 144125000*/ };  // FT8 freqs
 #endif
 #endif
 
@@ -4224,16 +4264,20 @@ const char* filt_label[N_FILT+1] = { "Full", "3000", "2400", "1800", "500", "200
 #else
 const char* filt_label[N_FILT+1] = { "Full", "2400", "2000", "1500", "500", "200", "100", "50" };
 #endif
-const char* band_label[N_BANDS] = { "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m" };
+const char* band_label[N_BANDS] = { "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "11m", "10m", "6m" };
 const char* stepsize_label[] = { "10M", "1M", "0.5M", "100k", "10k", "1k", "0.5k", "100", "10", "1" };
 const char* att_label[] = { "0dB", "-13dB", "-20dB", "-33dB", "-40dB", "-53dB", "-60dB", "-73dB" };
 #ifdef CLOCK
 const char* smode_label[] = { "OFF", "dBm", "S", "S-bar", "wpm", "Vss", "time" };
 #else
+#ifdef S_CUSTOM
+const char* smode_label[] = { "OFF", "dBm", "S", "S-bar", "wpm", "Vss", "Custom" };
+#else
 #ifdef VSS_METER
 const char* smode_label[] = { "OFF", "dBm", "S", "S-bar", "wpm", "Vss" };
 #else
 const char* smode_label[] = { "OFF", "dBm", "S", "S-bar", "wpm" };
+#endif
 #endif
 #endif
 #ifdef SWR_METER
@@ -4247,11 +4291,11 @@ const char* agc_label[] = { "OFF", "Fast", "Slow" };
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
-#define N_PARAMS 44  // number of (visible) parameters
+#define N_PARAMS 45  // number of (visible) parameters
 
 #define N_ALL_PARAMS (N_PARAMS+5)  // number of parameters
 
-enum params_t {_NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, NR, ATT, ATT2, SMETER, SWRMETER, CWDEC, CWTONE, CWOFF, SEMIQSK, KEY_WPM, KEY_MODE, KEY_PIN, KEY_TX, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL=0xff};
+enum params_t {_NULL, VOLUME, SQUELCH, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, NR, ATT, ATT2, SMETER, SWRMETER, CWDEC, CWTONE, CWOFF, SEMIQSK, KEY_WPM, KEY_MODE, KEY_PIN, KEY_TX, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL=0xff};
 
 int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 {
@@ -4263,25 +4307,26 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
   
   switch(id){    // Visible parameters
     case VOLUME:  paramAction(action, volume, 0x11, F("Volume"), NULL, -1, 16, false); break;
-    case MODE:    paramAction(action, mode, 0x12, F("Mode"), mode_label, 0, _N(mode_label) - 1, false); break;
-    case FILTER:  paramAction(action, filt, 0x13, F("Filter BW"), filt_label, 0, _N(filt_label) - 1, false); break;
-    case BAND:    paramAction(action, bandval, 0x14, F("Band"), band_label, 0, _N(band_label) - 1, false); break;
-    case STEP:    paramAction(action, stepsize, 0x15, F("Tune Rate"), stepsize_label, 0, _N(stepsize_label) - 1, false); break;
-    case VFOSEL:  paramAction(action, vfosel, 0x16, F("VFO Mode"), vfosel_label, 0, _N(vfosel_label) - 1, false); break;
+    case SQUELCH: paramAction(action, squelch_level, 0x12, F("SQL Level"), NULL, 0, 10, false); break;
+    case MODE:    paramAction(action, mode, 0x13, F("Mode"), mode_label, 0, _N(mode_label) - 1, false); break;
+    case FILTER:  paramAction(action, filt, 0x14, F("Filter BW"), filt_label, 0, _N(filt_label) - 1, false); break;
+    case BAND:    paramAction(action, bandval, 0x15, F("Band"), band_label, 0, _N(band_label) - 1, false); break;
+    case STEP:    paramAction(action, stepsize, 0x16, F("Tune Rate"), stepsize_label, 0, _N(stepsize_label) - 1, false); break;
+    case VFOSEL:  paramAction(action, vfosel, 0x17, F("VFO Mode"), vfosel_label, 0, _N(vfosel_label) - 1, false); break;
 #ifdef RIT_ENABLE
-    case RIT:     paramAction(action, rit, 0x17, F("RIT"), offon_label, 0, 1, false); break;    
+    case RIT:     paramAction(action, rit, 0x18, F("RIT"), offon_label, 0, 1, false); break;
 #endif
 #ifdef FAST_AGC
-    case AGC:     paramAction(action, agc, 0x18, F("AGC"), agc_label, 0, _N(agc_label) - 1, false); break;
+    case AGC:     paramAction(action, agc, 0x19, F("AGC"), agc_label, 0, _N(agc_label) - 1, false); break;
 #else
-    case AGC:     paramAction(action, agc, 0x18, F("AGC"), offon_label, 0, 1, false); break;
+    case AGC:     paramAction(action, agc, 0x19, F("AGC"), offon_label, 0, 1, false); break;
 #endif // FAST_AGC
-    case NR:      paramAction(action, nr, 0x19, F("NR"), NULL, 0, 8, false); break;
-    case ATT:     paramAction(action, att, 0x1A, F("ATT"), att_label, 0, 7, false); break;
-    case ATT2:    paramAction(action, att2, 0x1B, F("ATT2"), NULL, 0, 16, false); break;
-    case SMETER:  paramAction(action, smode, 0x1C, F("S-meter"), smode_label, 0, _N(smode_label) - 1, false); break;
+    case NR:      paramAction(action, nr, 0x1A, F("NR"), NULL, 0, 8, false); break;
+    case ATT:     paramAction(action, att, 0x1B, F("ATT"), att_label, 0, 7, false); break;
+    case ATT2:    paramAction(action, att2, 0x1C, F("ATT2"), NULL, 0, 16, false); break;
+    case SMETER:  paramAction(action, smode, 0x1D, F("S-meter"), smode_label, 0, _N(smode_label) - 1, false); break;
 #ifdef SWR_METER
-    case SWRMETER:  paramAction(action, swrmeter, 0x1D, F("SWR Meter"), swr_label, 0, _N(swr_label) - 1, false); break;
+    case SWRMETER:  paramAction(action, swrmeter, 0x1E, F("SWR Meter"), swr_label, 0, _N(swr_label) - 1, false); break;
 #endif
 #ifdef CW_DECODER
     case CWDEC:   paramAction(action, cwdec, 0x21, F("CW Decoder"), offon_label, 0, 1, false); break;
@@ -5202,8 +5247,10 @@ void loop()
     }
     else
 #endif  //CW_DECODER
-      if((!semi_qsk_timeout) && (!vox_tx))
+      if((!semi_qsk_timeout) && (!vox_tx)) {
         smeter();
+        process_squelch();
+      }
   }
 
 #ifdef KEYER  //Keyer
@@ -5290,6 +5337,8 @@ void loop()
 #endif
       if(inv ^ _digitalRead(BUTTONS)) break;  // break if button is pressed (to prevent potential lock-up)
     } while(!_digitalRead(pin)); // until released
+    // PTT released
+
     switch_rxtx(0);
    }
 #endif //TX_ENABLE
@@ -5708,7 +5757,7 @@ void loop()
     //noInterrupts();
     uint8_t f = freq / 1000000UL;
     set_lpf(f);
-    bandval = (f > 32) ? 10 : (f > 26) ? 9 : (f > 22) ? 8 : (f > 20) ? 7 : (f > 16) ? 6 : (f > 12) ? 5 : (f > 8) ? 4 : (f > 6) ? 3 : (f > 4) ? 2 : (f > 2) ? 1 : 0;  prev_bandval = bandval; // align bandval with freq
+    bandval = (f > 32) ? 11 : (f > 27) ? 10 : (f > 26) ? 9 : (f > 22) ? 8 : (f > 20) ? 7 : (f > 16) ? 6 : (f > 12) ? 5 : (f > 8) ? 4 : (f > 6) ? 3 : (f > 4) ? 2 : (f > 2) ? 1 : 0;  prev_bandval = bandval; // align bandval with freq
 
     if(mode == CW){
       si5351.freq(freq + cw_offset, rx_ph_q, 0/*90, 0*/);  // RX in CW-R (=LSB), correct for CW-tone offset
